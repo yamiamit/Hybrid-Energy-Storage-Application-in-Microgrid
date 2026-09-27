@@ -1,0 +1,5 @@
+department,machine,rated_kw,scaled_kw
+Mechanical Engineering + Central Workshop,Foundry melting furnace,35.0,35.0
+Electronics and Electrical Engineering,High-voltage test set,25.0,25.0
+Mechanical Engineering + Central Workshop,CNC vertical milling,18.0,18.0
+Mechanical Engineering + Central Workshop,CNC lathe,15.0,15.0
