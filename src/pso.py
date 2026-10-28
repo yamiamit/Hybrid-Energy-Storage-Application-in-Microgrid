@@ -88,7 +88,7 @@ def evaluate(x):
 
 def snap(x):
     """The design a position actually represents: integer strings, whole kW."""
-    return np.array([round(x[0]), round(x[1]), round(x[2]), round(x[3])], dtype=float)
+    return np.round(np.asarray(x, dtype=float))
 
 
 def run_pso(seed, bounds=None, n_particles=N_PARTICLES,
@@ -100,12 +100,35 @@ def run_pso(seed, bounds=None, n_particles=N_PARTICLES,
     """
     lo = LO if bounds is None else np.array([b[1] for b in bounds])
     hi = HI if bounds is None else np.array([b[2] for b in bounds])
+    best, (score, npc, lpsp), n_evals, history, trail = swarm(
+        evaluate, lo, hi, seed, n_particles, n_iterations, record=record)
+    res = dict(seed=seed, pv_kw=best[0], batt_strings=int(best[1]),
+               batt_kwh=int(best[1]) * 60, converter_kw=best[2],
+               sc_strings=int(best[3]), npc=npc, lpsp=lpsp, score=score,
+               feasible=score < PENALTY, evaluations=n_evals)
+    if record:
+        res["trail"] = trail
+    return res, history
+
+
+def swarm(objective, lo, hi, seed, n_particles=N_PARTICLES,
+          n_iterations=N_ITERATIONS, start=None, record=False):
+    """
+    The PSO search itself, for any objective that maps a snapped position to
+    a tuple whose first entry is the score to minimise. `start` optionally
+    places known designs as the first particles, so the swarm can only
+    improve on them. Returns the best snapped position, its objective tuple,
+    the number of evaluations, the convergence history and the trail.
+    """
     N_PARTICLES, N_ITERATIONS = n_particles, n_iterations
     rng = np.random.default_rng(seed)
     dim = len(lo)
     vmax = VMAX_FRACTION * (hi - lo)
 
     pos = lo + rng.random((N_PARTICLES, dim)) * (hi - lo)
+    if start is not None:
+        for i, s in enumerate(start[:N_PARTICLES]):
+            pos[i] = np.clip(s, lo, hi)
     trail = [pos.copy()] if record else None
     vel = rng.uniform(-vmax, vmax, size=(N_PARTICLES, dim))
 
@@ -117,7 +140,7 @@ def run_pso(seed, bounds=None, n_particles=N_PARTICLES,
         nonlocal n_evals
         key = tuple(snap(x))
         if key not in cache:
-            cache[key] = evaluate(key)
+            cache[key] = objective(key)
             n_evals += 1
         return cache[key]
 
@@ -156,14 +179,8 @@ def run_pso(seed, bounds=None, n_particles=N_PARTICLES,
                             best_score=g_score))
 
     best = snap(g_best)
-    score, npc, lpsp = cache[tuple(best)]
-    res = dict(seed=seed, pv_kw=best[0], batt_strings=int(best[1]),
-               batt_kwh=int(best[1]) * 60, converter_kw=best[2],
-               sc_strings=int(best[3]), npc=npc, lpsp=lpsp, score=score,
-               feasible=score < PENALTY, evaluations=n_evals)
-    if record:
-        res["trail"] = np.array(trail)
-    return res, history
+    return (best, cache[tuple(best)], n_evals, history,
+            np.array(trail) if record else None)
 
 
 def fine_grid(center):

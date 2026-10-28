@@ -536,14 +536,23 @@ def fig_tornado():
                     c[k] = o
             rows.append(dict(parameter=label, low=f"{lo:.2f}x", high=f"{hi:.2f}x",
                              npc_low=out[0], npc_high=out[1], npc_base=base))
-        # battery lifetime throughput lives in the simulator module
-        orig = simulator.BATT_LIFETIME_THROUGHPUT_KWH
+        # battery cycle life and room temperature live in the simulator module
+        orig = simulator.BATT_CYCLE_LIFE
         out = []
         for f in (0.8, 1.2):
-            simulator.BATT_LIFETIME_THROUGHPUT_KWH = orig * f
+            simulator.BATT_CYCLE_LIFE = tuple((dod, n * f) for dod, n in orig)
             out.append(reoptimise())
-        simulator.BATT_LIFETIME_THROUGHPUT_KWH = orig
-        rows.append(dict(parameter="Battery lifetime throughput", low="0.80x", high="1.20x",
+        simulator.BATT_CYCLE_LIFE = orig
+        rows.append(dict(parameter="Battery cycle life", low="0.80x", high="1.20x",
+                         npc_low=out[0], npc_high=out[1], npc_base=base))
+        orig = simulator.BATT_FLOAT_LIFE_YEARS
+        out = []
+        for dt in (-3.0, 3.0):
+            simulator.BATT_FLOAT_LIFE_YEARS = simulator.service_life_years(
+                d["tamb"], simulator.BATT_ROOM_OFFSET_C + dt)
+            out.append(reoptimise())
+        simulator.BATT_FLOAT_LIFE_YEARS = orig
+        rows.append(dict(parameter="Battery room temperature", low="−3 °C", high="+3 °C",
                          npc_low=out[0], npc_high=out[1], npc_base=base))
         out = []
         for f in (0.9, 1.1):
@@ -559,10 +568,14 @@ def fig_tornado():
     df = df.assign(span=(df.npc_high - df.npc_low).abs()).sort_values("span")
     fig, ax = plt.subplots(figsize=(9, 4.4))
     for i, r in enumerate(df.itertuples()):
-        for v, lab, c in [(r.npc_low / 1e6, r.low, FLOW), (r.npc_high / 1e6, r.high, ENERGY)]:
+        cases = [(r.npc_low / 1e6, r.low, FLOW, r.npc_high / 1e6),
+                 (r.npc_high / 1e6, r.high, ENERGY, r.npc_low / 1e6)]
+        for v, lab, c, other in cases:
             ax.barh(i, v - base, left=base, color=c, height=0.6)
-            ax.text(v + (1.2 if v >= base else -1.2), i, f"{lab}  ₹{v:.0f} M",
-                    va="center", ha="left" if v >= base else "right", fontsize=8.5, color=SLATE)
+            # an unchanged case goes on the side its partner leaves free
+            right = v > base + 0.05 or (abs(v - base) <= 0.05 and other < base)
+            ax.text(v + (1.2 if right else -1.2), i, f"{lab}  ₹{v:.0f} M",
+                    va="center", ha="left" if right else "right", fontsize=8.5, color=SLATE)
     ax.axvline(base, color=INK, lw=1.2)
     ax.set_yticks(range(len(df)))
     ax.set_yticklabels(df.parameter)

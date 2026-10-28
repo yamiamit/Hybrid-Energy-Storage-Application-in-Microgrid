@@ -11,9 +11,10 @@ assuming the answer:
   B. How big must the SC be?  The storage power is split by a first-order
      low-pass filter: slow changes to the battery, fast ones to the SC.
      The filter time constant tau sets the SC size and cost.
-  C. When is it worth it?  The battery-life extension the SC must buy to
-     repay its cost, and the battery size below which the transient is a
-     real stress on the battery.
+  C. Is it worth it?  The battery wear the SC removes, by rainflow counting
+     the second-scale cycles with and without it against the datasheet
+     cycle-life curve, turned into NPC saved and set against the SC's cost,
+     for this design and for smaller battery banks.
 
 Every SC number still rests on placeholders (module price, starting surge,
 on-times). They are declared below so they can be replaced.
@@ -24,7 +25,7 @@ Outputs (figures/)
     sc_sizing.png         SC modules and cost against filter time constant
     sc_battery_relief.png battery peak power and ramp rate against tau
     sc_crate.png          the transient as a C-rate, against battery size
-    sc_breakeven.png      battery-life extension the SC must buy to pay off
+    sc_payback.png        battery NPC the SC saves against what it costs
 
 Run from the project root, after pso.py:
     python src/sc_study.py
@@ -38,10 +39,12 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from prepare_data import DEPARTMENTS, SUBSET
+from prepare_data import DEPARTMENTS, SUBSET, VACATION_ACTIVITY, vacation_mask
 from costs import SUPERCAP, CONVERTER, sc_module_energy_j, sc_modules_in_series
 from simulator import (compute_npc, simulate, load_inputs, TRANSIENT_J,
-                       SC_PRICE_PER_MODULE_PLACEHOLDER, BATT_KWH_PER_STRING)
+                       SC_PRICE_PER_MODULE_PLACEHOLDER, BATT_KWH_PER_STRING,
+                       BATT_CYCLE_LIFE, BATT_FLOAT_LIFE_YEARS,
+                       cycles_to_failure, rainflow_cycles, cycle_damage)
 from plot_load import style, INK, SLATE, MUTE, ENERGY, FLOW
 
 OUT = "figures"
@@ -78,6 +81,7 @@ WELD_FLICKER = 0.25             # +/- fraction, second to second, while arcing
 
 TAUS_S = [1, 2, 5, 10, 20, 30, 60, 120, 300]
 DEMO_TAU_S = 10
+PAYBACK_TAU_S = 2               # filter used for the bank-size comparison
 
 DCDC_INR_PER_KW = CONVERTER["capital_inr_per_kw"]   # SC needs its own DC-DC stage
 
@@ -333,61 +337,122 @@ def fig_crate(peak_kw, opt):
     save(fig, "sc_crate.png")
 
 
-def npc_battery_only(pv, nb, conv, life):
-    return compute_npc(pv, nb, 0, conv, life)[0]
+def switching_windows_per_year():
+    """
+    Windows a year in which the workshop is switching: weekday hours when
+    any transient machine is scheduled, scaled by the vacation activity.
+    Every such window is assumed as busy as the 11 am one - generous to the SC.
+    """
+    hours = sorted({h for dept in SUBSET for item in DEPARTMENTS[dept]["equipment"]
+                    if item["transient"] for h in item["hours"]})
+    t = pd.date_range("2023-01-01", periods=load_inputs()["n"], freq="h")
+    working = np.isin(t.hour, hours) & (t.dayofweek < 5)
+    activity = np.where(vacation_mask(t.month.values, t.day.values), VACATION_ACTIVITY, 1.0)
+    return float(np.sum(working * activity)) * 3600.0 / WINDOW_S
 
 
-def fig_breakeven(opt, sc_package_inr, sc_filter_inr):
-    full = simulate(opt.pv_kw, opt.batt_strings, 0, converter_kw=opt.converter_kw, full=True)
-    life0 = full["batt_life_years"]
-    ext = np.linspace(0, 60, 241)
+_MICRO = {}
+
+
+def micro_damage(wins, e_kwh, tau_s):
+    """
+    Battery wear from the second-by-second cycles of one window (median of
+    the windows), as (upper, lower) bounds. tau_s = 0 means no SC.
+
+    These cycles are far shallower than the datasheet's lowest point
+    (20 % DoD), so the cycle-life curve has to be extended below it:
+      upper  the datasheet's log-log slope carried on down - shallow cycles
+             wear more per kWh, as they already do between 20 and 50 %
+      lower  constant wear per kWh below 20 % DoD, the throughput view
+    The window's slow drift is removed first: the hourly model counts that.
+    """
+    key = (round(e_kwh, 3), tau_s)
+    if key in _MICRO:
+        return _MICRO[key]
+    d0, n0 = BATT_CYCLE_LIFE[0]
+    up, lo = [], []
+    for p in wins:
+        pb = p if tau_s == 0 else low_pass(p, tau_s)
+        soc = -np.cumsum(pb) / 3600.0 / e_kwh
+        soc -= np.linspace(soc[0], soc[-1], len(soc))
+        depth, count = rainflow_cycles(soc)
+        depth, count = depth[depth > 0], count[depth > 0]
+        n_up = cycles_to_failure(depth)
+        n_lo = np.where(depth < d0, n0 * d0 / depth, n_up)
+        up.append(np.sum(count / n_up))
+        lo.append(np.sum(count / n_lo))
+    _MICRO[key] = (float(np.median(up)), float(np.median(lo)))
+    return _MICRO[key]
+
+
+def npc_battery_only(opt, nb, life):
+    return compute_npc(opt.pv_kw, nb, 0, opt.converter_kw, life)[0]
+
+
+def sc_saving(opt, nb, tau_s, wins, n_win):
+    """
+    NPC an SC with filter tau_s saves on a bank of nb strings by slowing its
+    wear, as (upper, lower) bounds, plus battery life without and with it.
+    Wear = hourly cycles + second-scale cycles; life is capped at float
+    life, which no SC can extend.
+    """
+    r = simulate(opt.pv_kw, nb, 0, converter_kw=opt.converter_kw, full=True)
+    d_hourly = cycle_damage(r["soc_series"] / r["e_batt_kwh"])
+    e = nb * BATT_KWH_PER_STRING
+    without, with_sc = micro_damage(wins, e, 0), micro_damage(wins, e, tau_s)
+    saved, lives = [], []
+    for b in (0, 1):
+        life_b = min(BATT_FLOAT_LIFE_YEARS, 1.0 / (d_hourly + n_win * without[b]))
+        life_sc = min(BATT_FLOAT_LIFE_YEARS, 1.0 / (d_hourly + n_win * with_sc[b]))
+        saved.append(npc_battery_only(opt, nb, life_b) - npc_battery_only(opt, nb, life_sc))
+        lives.append((life_b, life_sc))
+    return saved, lives
+
+
+def fig_payback(opt, df, wins, n_win):
+    cost = df.groupby("tau_s").cost_inr.median()
+    taus = np.array(TAUS_S)
+    res = [sc_saving(opt, opt.batt_strings, tau, wins, n_win) for tau in taus]
+    up = np.array([s[0] for s, _ in res]) / 1e6
+    lo = np.array([s[1] for s, _ in res]) / 1e6
 
     fig, (a1, a2) = plt.subplots(1, 2, figsize=(11.5, 4.4))
-    banks = [(opt.batt_strings, f"{opt.batt_kwh/1000:.1f} MWh (this design)", BATT),
-             (max(1, round(opt.batt_strings / 4)), None, FLOW),
-             (max(1, round(opt.batt_strings / 15)), None, ENERGY)]
-    for nb, label, c in banks:
-        base = npc_battery_only(opt.pv_kw, nb, opt.converter_kw, life0)
-        saving = [(base - npc_battery_only(opt.pv_kw, nb, opt.converter_kw,
-                                           life0 * (1 + x / 100))) / 1e6 for x in ext]
-        a1.plot(ext, saving, color=c, lw=2,
-                label=label or f"{nb * BATT_KWH_PER_STRING / 1000:.1f} MWh bank")
-    for cost, name, x, ha in [(sc_package_inr, "4-string SC + 93 kW DC-DC", ext[-1], "right"),
-                              (sc_filter_inr, f"SC for τ = {DEMO_TAU_S} s filter", 14, "left")]:
-        a1.axhline(cost / 1e6, color=SC, ls="--", lw=1.2)
-        a1.text(x, cost / 1e6 * 1.06, f"{name}  ₹{cost/1e6:.1f} M", ha=ha,
-                fontsize=8.5, color=SC)
-    a1.set_xlabel("Battery life extension (%)")
-    a1.set_ylabel("NPC saved (₹ million)")
-    title(a1, f"What a longer battery life is worth  ·  base life {life0:.1f} years")
+    a1.plot(taus, cost.loc[taus] / 1e6, color=SC, lw=2, marker="o", ms=5, label="SC + DC-DC cost")
+    a1.fill_between(taus, np.maximum(lo, 1e-3), up, color=BATT, alpha=0.2, lw=0,
+                    label="NPC saved, down to the lower bound")
+    a1.plot(taus, up, color=BATT, lw=2, marker="o", ms=5,
+            label="NPC saved, upper bound")
+    a1.set_xscale("log")
+    a1.set_yscale("log")
+    a1.set_xlabel("Filter time constant τ (s, log)")
+    a1.set_ylabel("₹ million (log)")
+    title(a1, f"This design ({opt.batt_kwh/1000:.1f} MWh): at best the SC breaks even, at τ ≈ 1-2 s")
     a1.legend(frameon=False, fontsize=8.5, loc="upper left")
     style(a1)
 
-    strings = np.unique(np.round(np.logspace(0, np.log10(opt.batt_strings * 1.5), 40)).astype(int))
-    need = []
-    for nb in strings:
-        base = npc_battery_only(opt.pv_kw, nb, opt.converter_kw, life0)
-        x_req = np.nan
-        for x in np.linspace(0, 300, 1201):
-            if base - npc_battery_only(opt.pv_kw, nb, opt.converter_kw, life0 * (1 + x / 100)) >= sc_package_inr:
-                x_req = x
-                break
-        need.append(x_req)
+    strings = np.unique(np.round(np.logspace(0, np.log10(opt.batt_strings * 1.5), 25)).astype(int))
+    res = [sc_saving(opt, nb, PAYBACK_TAU_S, wins, n_win)[0] for nb in strings]
+    up_b = np.array([s[0] for s in res]) / 1e6
+    lo_b = np.array([s[1] for s in res]) / 1e6
     mwh = strings * BATT_KWH_PER_STRING / 1000
-    a2.plot(mwh, need, color=SC, lw=2)
+    c = cost.loc[PAYBACK_TAU_S] / 1e6
+    a2.fill_between(mwh, np.maximum(lo_b, 1e-3), np.maximum(up_b, 1e-3), color=BATT, alpha=0.2, lw=0)
+    a2.plot(mwh, np.maximum(up_b, 1e-3), color=BATT, lw=2, label="NPC saved, upper bound")
+    a2.axhline(c, color=SC, lw=2, label=f"SC + DC-DC cost, τ = {PAYBACK_TAU_S} s")
     a2.axvline(opt.batt_kwh / 1000, color=INK, ls=":", lw=1.2)
-    i = np.argmin(np.abs(strings - opt.batt_strings))
-    a2.plot(mwh[i], need[i], "o", color=SC, ms=7)
-    a2.text(mwh[i] * 0.93, need[i] + 15, f"this design: {need[i]:.0f} %", ha="right",
-            fontsize=9, color=INK)
+    a2.text(opt.batt_kwh / 1000 * 0.92, 15, "this design", ha="right", fontsize=8.5, color=INK)
     a2.set_xscale("log")
-    a2.set_ylim(0, 300)
+    a2.set_yscale("log")
+    a2.set_ylim(1e-3, 30)
     a2.set_xlabel("Battery bank (MWh, log)")
-    a2.set_ylabel("Life extension needed to repay the SC (%)")
-    title(a2, "Break-even for the 4-string SC package")
+    a2.set_ylabel("₹ million (log)")
+    # a small bank wears more per kWh, but is cheaper to replace
+    title(a2, "A smaller bank saves fewer rupees, not more")
+    a2.legend(frameon=False, fontsize=8.5, loc="lower left")
     style(a2)
-    save(fig, "sc_breakeven.png")
-    return life0, need[i]
+    save(fig, "sc_payback.png")
+    pays = mwh[up_b >= c]
+    return res, pays
 
 
 def main():
@@ -408,20 +473,19 @@ def main():
     fig_relief(df)
     fig_crate(peak, opt)
 
-    price = SUPERCAP["capital_inr_per_module"] or SC_PRICE_PER_MODULE_PLACEHOLDER
-    n_str = math.ceil(TRANSIENT_J / (sc_module_energy_j() * sc_modules_in_series()))
-    package = n_str * sc_modules_in_series() * price + 93.0 * DCDC_INR_PER_KW
-    filt = df[df.tau_s == DEMO_TAU_S].cost_inr.median()
-    life0, need = fig_breakeven(opt, package, filt)
+    n_win = switching_windows_per_year()
+    fig_payback(opt, df, wins, n_win)
 
     med = df.groupby("tau_s").median(numeric_only=True)
-    print("\n  tau (s)   SC strings   SC kJ   SC peak kW   cost ₹M   battery ramp %")
+    print(f"\n  {n_win:,.0f} switching windows a year; battery float life "
+          f"{BATT_FLOAT_LIFE_YEARS:.1f} y\n")
+    print("  tau (s)  strings  cost ₹M  ramp %   life without -> with SC (y)   NPC saved ₹M")
     for tau, r in med.iterrows():
-        print(f"  {tau:7.0f}   {r.strings:10.0f}   {r.sc_energy_kj:5.0f}   {r.sc_power_kw:10.0f}"
-              f"   {r.cost_inr/1e6:7.1f}   {r.batt_ramp_pct:14.0f}")
+        saved, lives = sc_saving(opt, opt.batt_strings, tau, wins, n_win)
+        print(f"  {tau:7.0f}  {r.strings:7.0f}  {r.cost_inr/1e6:7.1f}  {r.batt_ramp_pct:6.0f}"
+              f"   {lives[0][0]:.2f} -> {lives[0][1]:.2f}  (lower {lives[1][0]:.2f} -> {lives[1][1]:.2f})"
+              f"   {saved[1]/1e6:.2f} - {saved[0]/1e6:.2f}")
     print(f"\n  median surge above the window mean: {peak:.0f} kW")
-    print(f"  4-string SC + 93 kW DC-DC package: ₹{package/1e6:.1f} M")
-    print(f"  battery life {life0:.1f} y; the package pays off if it extends life by {need:.0f} %")
 
 
 if __name__ == "__main__":

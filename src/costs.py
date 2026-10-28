@@ -114,11 +114,23 @@ BATTERY_LA = dict(
     # derived: 22000 / 3 kWh
     capital_inr_per_kwh=22_000.0 / 3.0,        # = 7333 INR/kWh
 
-    # TODO: the paper does not state a cycle life. Needed for the rainflow
-    # degradation model - get two (depth-of-discharge, cycles) points from
-    # the Discover 12VRE-3000TF-L datasheet.
-    cycles_at_50_dod=None,
-    cycles_at_80_dod=None,
+    # Cycle life against depth of discharge, at 20 C. Not in the paper.
+    # Source: Discover Energy, "12VRE-3000TF-L Tubular Flooded RE Series"
+    # datasheet, updated 12 Nov 2013 - the exact model Kumar et al. use.
+    # (depth of discharge as a fraction of rated capacity, cycles to end of life)
+    cycle_life=((0.20, 5000), (0.50, 2500), (0.80, 1500)),
+    # The 12VRE-3000TF (OPzS) datasheet of 7 May 2018 quotes fewer cycles. Kept as
+    # the pessimistic case for the sensitivity study.
+    cycle_life_later_sheet=((0.20, 4500), (0.50, 2000), (0.80, 1100)),
+    internal_resistance_ohm=0.005,      # RINT, same 2013 datasheet
+
+    # Expected service (float) life against operating temperature, 12 V
+    # blocks, read off the lower (pessimistic) edge of the band in the same
+    # datasheet's graph. 18 years at 20 C and below; roughly halves every 8 C.
+    # (temperature C, years)
+    service_life=((20.0, 18.0), (22.5, 15.0), (25.0, 12.5), (27.5, 10.5),
+                  (30.0, 8.8), (32.5, 7.4), (35.0, 6.1), (37.5, 5.1),
+                  (40.0, 4.3), (45.0, 3.0), (50.0, 2.1), (55.0, 1.5)),
 )
 
 

@@ -35,6 +35,7 @@ Run from the project root:
 
 import numpy as np
 import pandas as pd
+import rainflow
 
 from costs import (PV, BATTERY_LA, CONVERTER, SUPERCAP, ECON,
                    sc_strings_for_energy, sc_modules_in_series)
@@ -65,12 +66,24 @@ CONVERTER_OVERSIZE = 1.10
 # simulator is defensible until a real price goes in.
 SC_PRICE_PER_MODULE_PLACEHOLDER = 45_000.0
 
-# --- PLACEHOLDER: lead-acid lifetime throughput ----------------------
-# HOMER's approach: a battery dies after a fixed amount of energy has
-# passed through it, or after its float life, whichever comes first.
-# Get the real figure from the Discover 12VRE-3000TF-L datasheet.
-BATT_LIFETIME_THROUGHPUT_KWH = 2_250.0   # per 3 kWh battery
-BATT_FLOAT_LIFE_YEARS = 10.0
+# --- Battery life ----------------------------------------------------
+# "rainflow": the year's hourly SoC trace is split into cycles by rainflow
+#   counting. A cycle of depth D uses up 1/N(D) of the battery, N(D) read
+#   off the datasheet cycle-life curve (Miner's rule). Shallow cycles cost
+#   far less per kWh than deep ones, which a throughput model cannot see.
+# "throughput": HOMER's simpler model - the battery dies after a fixed
+#   amount of energy has passed through it. Kept for comparison.
+# Either way the battery is replaced at its float life if that comes first.
+BATT_LIFE_MODEL = "rainflow"
+BATT_CYCLE_LIFE = BATTERY_LA["cycle_life"]
+# Battery room temperature above outdoor ambient. 0 = a ventilated room
+# that follows the outdoor air. TODO: confirm for the actual battery room.
+BATT_ROOM_OFFSET_C = 0.0
+
+# Throughput the datasheet implies at its deepest rated cycle:
+# 1500 cycles x 80 % DoD x 3 kWh = 3600 kWh per battery.
+_DOD_DEEP, _N_DEEP = BATT_CYCLE_LIFE[-1]
+BATT_LIFETIME_THROUGHPUT_KWH = _N_DEEP * _DOD_DEEP * BATTERY_LA["nominal_capacity_kwh"]
 
 BATT_KWH_PER_STRING = BATTERY_LA["nominal_capacity_kwh"] * BATTERY_LA["string_size"]
 
@@ -231,18 +244,69 @@ def run_dispatch(pv_kw, n_batt_strings, converter_kw, data=None):
 # BATTERY LIFE
 # =====================================================================
 
-def battery_life_years(n_batt_strings, annual_throughput_kwh):
+def service_life_years(tamb, room_offset_c=BATT_ROOM_OFFSET_C):
     """
-    Throughput model, as HOMER uses for lead-acid. Replaced by rainflow
-    cycle counting in Step 7.
+    Float life at the site. Ageing runs at 1/L(T) per year at temperature T,
+    L(T) from the datasheet service-life curve, so the hourly rate is
+    averaged over the year and inverted. Hot hours count for more than the
+    mean temperature suggests, as they should.
     """
+    temp, years = np.array(BATTERY_LA["service_life"]).T
+    life = np.interp(np.asarray(tamb) + room_offset_c, temp, years)
+    return float(1.0 / np.mean(1.0 / life))
+
+
+BATT_FLOAT_LIFE_YEARS = service_life_years(load_inputs()["tamb"])
+
+
+def cycles_to_failure(dod, curve=None):
+    """
+    Cycles a battery survives at depth of discharge dod (fraction of rated
+    capacity), from the datasheet points joined by straight lines on
+    log-log axes. Beyond the datasheet range the end segments are extended.
+    """
+    d, n = np.log(np.array(curve or BATT_CYCLE_LIFE, dtype=float)).T
+    x = np.log(np.clip(np.asarray(dod, dtype=float), 1e-6, 1.0))
+    y = np.interp(x, d, n)
+    slope_lo = (n[1] - n[0]) / (d[1] - d[0])
+    slope_hi = (n[-1] - n[-2]) / (d[-1] - d[-2])
+    y = np.where(x < d[0], n[0] + slope_lo * (x - d[0]), y)
+    y = np.where(x > d[-1], n[-1] + slope_hi * (x - d[-1]), y)
+    return np.exp(y)
+
+
+def rainflow_cycles(soc_fraction):
+    """Cycle depths and counts (1 or 0.5) of an SoC trace, by rainflow."""
+    cyc = [(rng, count) for rng, _, count, _, _ in rainflow.extract_cycles(soc_fraction)]
+    if not cyc:
+        return np.zeros(0), np.zeros(0)
+    depth, count = np.array(cyc).T
+    return depth, count
+
+
+def cycle_damage(soc_fraction, curve=None):
+    """Fraction of battery life used by one pass of the SoC trace (Miner)."""
+    depth, count = rainflow_cycles(soc_fraction)
+    keep = depth > 0
+    return float(np.sum(count[keep] / cycles_to_failure(depth[keep], curve)))
+
+
+def battery_life_years(n_batt_strings, res):
+    """Battery life in years from one year of dispatch, capped at float life."""
     n_batteries = n_batt_strings * BATTERY_LA["string_size"]
-    if n_batteries == 0 or annual_throughput_kwh <= 0:
+    if n_batteries == 0:
         return BATT_FLOAT_LIFE_YEARS
 
-    total_throughput = n_batteries * BATT_LIFETIME_THROUGHPUT_KWH
-    throughput_life = total_throughput / annual_throughput_kwh
-    return min(BATT_FLOAT_LIFE_YEARS, throughput_life)
+    if BATT_LIFE_MODEL == "throughput":
+        if res["throughput"] <= 0:
+            return BATT_FLOAT_LIFE_YEARS
+        wear_life = n_batteries * BATT_LIFETIME_THROUGHPUT_KWH / res["throughput"]
+    else:
+        damage = cycle_damage(res["soc_series"] / res["e_batt"])
+        if damage <= 0:
+            return BATT_FLOAT_LIFE_YEARS
+        wear_life = 1.0 / damage
+    return min(BATT_FLOAT_LIFE_YEARS, wear_life)
 
 
 def replacement_years(life_years, project_years):
@@ -350,7 +414,7 @@ def simulate(pv_kw, n_batt_strings, n_sc_strings, converter_kw=None, full=False)
 
     res = run_dispatch(pv_kw, n_batt_strings, converter_kw)
 
-    batt_life = battery_life_years(n_batt_strings, res["throughput"])
+    batt_life = battery_life_years(n_batt_strings, res)
     npc, capex, annual_om, salvage, cost_parts = compute_npc(
         pv_kw, n_batt_strings, n_sc_strings, converter_kw, batt_life)
 
@@ -491,6 +555,30 @@ def verify():
           a["score"] >= PENALTY and r_big["score"] == r_big["npc"],
           f"LPSP {a['lpsp']*100:.1f}% scores {a['score']:.2e};"
           f" feasible scores its NPC")
+
+    # 9. battery life model against hand calculations
+    pts = np.array(BATT_CYCLE_LIFE, dtype=float)
+    check("cycle-life curve passes through the datasheet points",
+          np.allclose(cycles_to_failure(pts[:, 0]), pts[:, 1]),
+          ", ".join(f"{d:.0%}: {n:,.0f}" for d, n in BATT_CYCLE_LIFE))
+    one_year = np.tile([1.0, 0.5], 365)                  # 365 cycles at 50 % DoD
+    check("365 cycles at 50 % DoD use 365/2500 of the life",
+          rel(cycle_damage(np.append(one_year, 1.0)), 365 / 2500) < 1e-9,
+          f"damage {cycle_damage(np.append(one_year, 1.0)):.4f}")
+    # Per CYCLE a deeper cycle wears more. Per kWh it need not: this
+    # datasheet gives 1000 full-cycle equivalents at 20 % DoD, 1250 at 50 %.
+    shallow = np.append(np.tile([1.0, 0.75], 365), 1.0)
+    check("a deeper cycle wears more than a shallower one",
+          cycle_damage(shallow) < cycle_damage(np.append(one_year, 1.0)),
+          f"25 % DoD {cycle_damage(shallow):.3f} vs 50 % DoD "
+          f"{cycle_damage(np.append(one_year, 1.0)):.3f} per year")
+    check("float life is 18 years at a steady 20 C, 8.8 years at 30 C",
+          rel(service_life_years([20.0] * 24, 0.0), 18.0) < 1e-12
+          and rel(service_life_years([30.0] * 24, 0.0), 8.8) < 1e-12,
+          f"site float life {BATT_FLOAT_LIFE_YEARS:.1f} years")
+    check("battery life never exceeds float life",
+          max(a["batt_life_years"], r_big["batt_life_years"]) <= BATT_FLOAT_LIFE_YEARS,
+          f"{a['batt_life_years']:.1f} and {r_big['batt_life_years']:.1f} years")
 
     print("\n  " + ("ALL CHECKS PASSED" if ok else "SOME CHECKS FAILED - fix before Step 4"))
     return ok
