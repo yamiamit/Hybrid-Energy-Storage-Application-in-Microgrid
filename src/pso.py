@@ -30,7 +30,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from simulator import simulate, LPSP_TARGET, PENALTY
+from simulator import simulate, LPSP_TARGET, PENALTY, TRANSIENT_J
+from costs import sc_strings_for_energy
 
 GRID_CSV = "results/grid_sweep.csv"
 RUNS_CSV = "results/pso_runs.csv"
@@ -43,11 +44,14 @@ FIG = "figures/pso_convergence.png"
 
 # Search bounds. Wider than the grid on every axis, so the grid's answer
 # is reachable and PSO is not boxed in by the same edges.
-#            name             low     high
-BOUNDS = [("pv_kw",          1000.0, 8000.0),
-          ("batt_strings",      0.0,  500.0),
-          ("converter_kw",    300.0, 3000.0),
-          ("sc_strings",        0.0,   10.0)]
+# The SC count is pinned at what the 93 kW step needs: fewer is infeasible
+# and more only adds cost, so searching it only lets runs stall above it.
+SC_NEEDED = float(sc_strings_for_energy(TRANSIENT_J))
+#            name             low         high
+BOUNDS = [("pv_kw",          1000.0,     8000.0),
+          ("batt_strings",      0.0,      500.0),
+          ("converter_kw",    300.0,     3000.0),
+          ("sc_strings",   SC_NEEDED,  SC_NEEDED)]
 
 N_PARTICLES = 20
 N_ITERATIONS = 40
@@ -270,8 +274,7 @@ def main():
     spread = (feas.npc.max() - feas.npc.min()) / feas.npc.min() * 100
     print(f"  NPC across runs: best {feas.npc.min()/1e6:.1f} M, worst"
           f" {feas.npc.max()/1e6:.1f} M, spread {spread:.2f} %")
-    print(f"  every run chose {feas.sc_strings.min()}-{feas.sc_strings.max()}"
-          f" SC strings (requirement: 4)")
+    print(f"  SC strings pinned at the requirement: {SC_NEEDED:.0f}")
 
     # --- check 1: against the coarse grid ---
     best = feas.sort_values("npc").iloc[0]

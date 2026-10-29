@@ -33,6 +33,9 @@ ECON = dict(
 
     # "Based on CERC, 10.70 % has been considered as the discount factor
     #  for all the renewable energy technologies"
+    # NOTE: the CERC order the paper cites (Petition SM/03/2016) gives
+    # 10.64 %, not 10.70 %. The paper's value is kept for comparability;
+    # see resources/SOURCES.md.
     nominal_discount=0.1070,
 
     # HOMER discounts CONSTANT-currency cash flows at the REAL rate:
@@ -73,6 +76,9 @@ ECON = dict(
 # Do not add a separate inverter cost for the PV side.
 
 PV = dict(
+    # NOTE: CERC's FY 2016-17 benchmark is 53,002 INR/kW (530.02 lakh/MW);
+    # 50,502 looks like a typo in the paper. Kept for comparability - using
+    # 53,002 raises the NPC by about 2 % and leaves the design unchanged.
     capital_inr_per_kw=50_502.0,
     replacement_inr_per_kw=50_502.0,
     om_inr_per_kw_year=700.0,

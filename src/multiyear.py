@@ -63,7 +63,7 @@ SC_STRINGS = sc_strings_for_energy(TRANSIENT_J)
 # PSO effort. The staged plan has 9 variables, so it gets a bigger swarm.
 ONCE_PSO = dict(n_particles=20, n_iterations=40)
 STAGED_PSO = dict(n_particles=30, n_iterations=60)
-SEED = 1
+SEEDS = [1, 2]           # independent runs per case; the best is kept
 
 BATT = "#2a78d6"
 UNMET = "#e34948"
@@ -225,45 +225,99 @@ def upper_bounds(growth):
     return 2.5 * base * (1.0 + growth) ** (YEARS - 1)
 
 
-def optimise_once(growth, seed=SEED):
+# Local search after PSO, per (PV kW, strings, converter kW): first and
+# smallest step. PSO finds the right region; in 9 dimensions it rarely
+# lands exactly on the bottom, so a compass search finishes the job.
+POLISH_STEPS = (np.array([500.0, 20.0, 200.0]), np.array([10.0, 1.0, 10.0]))
+
+
+def polish(obj, x, lo, hi):
+    """
+    Compass search: try each variable one step up and one step down, keep
+    any improvement, and halve the steps when none is found. Returns the
+    improved position, its score and the evaluations used.
+    """
+    k = len(x) // 3
+    step = np.tile(POLISH_STEPS[0], k)
+    floor = np.tile(POLISH_STEPS[1], k)
+    x = pso.snap(x)
+    best = obj(x)[0]
+    n = 1
+    while True:
+        improved = False
+        for i in range(len(x)):
+            for sign in (1.0, -1.0):
+                y = x.copy()
+                y[i] = np.clip(round(x[i] + sign * step[i]), lo[i], hi[i])
+                if y[i] == x[i]:
+                    continue
+                s = obj(y)[0]
+                n += 1
+                if s < best:
+                    x, best, improved = y, s, True
+                    break
+        if not improved:
+            if np.all(step <= floor):
+                return x, best, n
+            step = np.maximum(floor, step / 2.0)
+
+
+def optimise_once(growth, seed):
     hi = upper_bounds(growth)
     lo = np.zeros(3)
     obj = lambda x: evaluate_plan([x], [1], growth)
-    best, (score, npc, worst), n_evals, _, _ = pso.swarm(obj, lo, hi, seed, **ONCE_PSO)
-    return [tuple(best)], score, n_evals
+    best, _, n_evals, _, _ = pso.swarm(obj, lo, hi, seed, **ONCE_PSO)
+    best, score, n_more = polish(obj, best, lo, hi)
+    return [tuple(best)], score, n_evals + n_more
 
 
-def optimise_staged(growth, once_plan, seed=SEED):
+def optimise_staged(growth, once_plan, seed):
     hi = np.tile(upper_bounds(growth), 3)
     lo = np.zeros(9)
     base = np.array(single_year_optimum())
     f = lambda y: (1.0 + growth) ** (y - 1)
     # warm starts: the build-once plan (so staged can only improve on it),
-    # and a plan that scales the single-year design to each stage's last year
-    scaled = [base * f(5), base * (f(10) - f(5)), base * (f(15) - f(10))]
-    start = [np.concatenate([np.array(once_plan[0]), np.zeros(6)]), np.concatenate(scaled)]
+    # and the single-year design scaled to each stage's last year. Scaled
+    # exactly, it sits a hair over the LPSP limit, so slightly larger copies
+    # are added too - feasible starting points right next to the optimum.
+    scaled = np.concatenate([base * f(5), base * (f(10) - f(5)), base * (f(15) - f(10))])
+    start = [np.concatenate([np.array(once_plan[0]), np.zeros(6)])]
+    start += [scaled * k for k in (1.0, 1.01, 1.02, 1.05)]
     obj = lambda x: evaluate_plan([x[0:3], x[3:6], x[6:9]], STAGE_STARTS, growth)
-    best, (score, npc, worst), n_evals, _, _ = pso.swarm(obj, lo, hi, seed, start=start,
-                                                         **STAGED_PSO)
-    return [tuple(best[0:3]), tuple(best[3:6]), tuple(best[6:9])], score, n_evals
+    best, _, n_evals, _, _ = pso.swarm(obj, lo, hi, seed, start=start, **STAGED_PSO)
+    best, score, n_more = polish(obj, best, lo, hi)
+    return [tuple(best[0:3]), tuple(best[3:6]), tuple(best[6:9])], score, n_evals + n_more
+
+
+def best_of_seeds(optimise, *args):
+    """Run one optimisation per seed and keep the best plan.
+    Returns the plan, its score, total evaluations, and the spread of
+    the seeds' scores as a percentage of the best."""
+    runs = [optimise(*args, seed) for seed in SEEDS]
+    scores = np.array([score for _, score, _ in runs])
+    best = runs[int(scores.argmin())]
+    spread = (scores.max() - scores.min()) / scores.min() * 100
+    return best[0], best[1], sum(ev for _, _, ev in runs), spread
 
 
 def run_all():
     rows = []
     for g in GROWTH_RATES:
-        once, s1, e1 = optimise_once(g)
-        staged, s2, e2 = optimise_staged(g, once)
-        for name, plan, starts, score, ev in [("build once", once, [1], s1, e1),
-                                              ("staged", staged, STAGE_STARTS, s2, e2)]:
+        once, s1, e1, sp1 = best_of_seeds(optimise_once, g)
+        staged, s2, e2, sp2 = best_of_seeds(optimise_staged, g, once)
+        for name, plan, starts, score, ev, spread in [
+                ("build once", once, [1], s1, e1, sp1),
+                ("staged", staged, STAGE_STARTS, s2, e2, sp2)]:
             r = evaluate_plan(plan, starts, g, full=True)
             row = dict(growth=g, strategy=name, npc=r["npc"], lcoe=r["lcoe"],
-                       worst_lpsp=r["worst_lpsp"], feasible=r["feasible"], evaluations=ev)
+                       worst_lpsp=r["worst_lpsp"], feasible=r["feasible"], evaluations=ev,
+                       seed_spread_pct=spread)
             for k, (p, n, c) in enumerate(r["stages"]):
                 row.update({f"pv_kw_{k+1}": p, f"batt_strings_{k+1}": n, f"converter_kw_{k+1}": c})
             rows.append(row)
             print(f"  growth {g:5.1%}  {name:10s}  NPC ₹{r['npc']/1e6:7.1f} M"
                   f"  LCOE {r['lcoe']:5.2f}  worst LPSP {r['worst_lpsp']:.3%}"
-                  f"  ({ev} evaluations)")
+                  f"  ({ev} evaluations, seeds within {spread:.2f} %)")
     df = pd.DataFrame(rows)
     df.to_csv(OUT_CSV, index=False)
     return df

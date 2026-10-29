@@ -16,9 +16,27 @@ Files marked **local** are in this folder or in `data/`. BibTeX entries for the 
   - Table 4: benchmark NPC and LCOE.
 - **Code:** `src/costs.py`, `src/prepare_data.py`, `src/simulator.py`
 
-**[2] Central Electricity Regulatory Commission (CERC)**, *Determination of Levellised Generic Tariff for FY 2016-17*, New Delhi, 2016.
-- **Used for:** the all-in PV benchmark cost of ₹50,502/kW and the 10.70% discount rate. Both are taken through [1].
-- **Status:** cited through [1] only. Download the order from cercind.gov.in before citing it directly.
+**[2] Central Electricity Regulatory Commission (CERC)**, *Determination of levellised generic tariff for FY 2016-17 under Regulation 8 of the CERC (Terms and Conditions for Tariff determination from Renewable Energy Sources) Regulations, 2012*, Petition No. SM/03/2016 (Suo-Motu), order dated 29 April 2016, New Delhi. https://cercind.gov.in/2016/orders/SORE.pdf
+- **Local:** `CERC_levellised_generic_tariff_FY2016-17_SM-03-2016.pdf`
+- This is reference [101] in [1].
+- **Used for:** the PV benchmark cost and the discount rate, both taken through [1].
+
+**[2a] Central Electricity Regulatory Commission (CERC)**, *Determination of Benchmark Capital Cost Norm for Solar PV power projects and Solar Thermal power projects applicable during FY 2016-17*, Petition No. 17/SM/2015, order dated 23 March 2016, New Delhi. https://cercind.gov.in/2016/orders/SO17.pdf
+- **Local:** `CERC_solar_PV_capital_cost_FY2016-17_17-SM-2015.pdf`
+- **Used for:** the breakdown behind the PV benchmark cost. It includes modules, civil works, mounting, the inverter (power conditioning unit) and evacuation; land is excluded.
+
+### ⚠ The paper misquotes its CERC source
+
+| | [1] says, and the code uses | [2] actually says |
+|---|---|---|
+| PV capital cost | ₹50,502/kW | **₹53,002/kW** (₹530.02 lakh/MW, [2] para 27 and [2a]) |
+| Discount factor | 10.70% | **10.64%** ([2] para 9: 12.76% × 0.70 × (1 − 34.61%) + 16% × 0.30) |
+
+₹50,502 appears nowhere in either order; it looks like a typo for ₹53,002. 10.70% was the earlier figure, which [2] replaces ("from 10.70% to 10.64%").
+
+**Effect on this project:** with both CERC values, NPC rises **2.3%** (₹385.1 M → ₹393.9 M) and the optimal design is **unchanged**.
+
+The code keeps the paper's values, so the results can be compared with [1] directly. State the discrepancy in the thesis.
 
 ## Site data
 
@@ -30,11 +48,23 @@ Files marked **local** are in this folder or in `data/`. BibTeX entries for the 
   - `T2M`: air temperature at 2 m (MERRA-2).
 - **Used for:** PV output, and the hourly temperature behind the battery's float life.
 - **Code:** `src/prepare_data.py` → `data/inputs.csv`
+- **More weather years:** the same point and parameters for 2013–2024 are saved in `data/nasa_power_years/`.
+  - Downloaded 29 October 2026 from the POWER hourly API.
+  - The 2023 copy matches `data/nasa_power_raw.csv` exactly.
+  - Used by `src/performance.py` and `src/sensitivity.py` to test the design in other weather years.
 
-**[4] IIT Guwahati public web pages** describing the Central Workshop (CNC, EDM, welding, foundry) and the Central Instruments Facility.
-- **Used for:** the equipment list in the bottom-up load model.
-- **Status:** the exact page URLs were never recorded. Find them again and add them here.
-- **Code:** `src/prepare_data.py`
+**[4] IIT Guwahati public web pages**, used for the equipment list in the bottom-up load model (`src/prepare_data.py`). Checked 28 October 2026.
+- **Central Workshop:** https://iitg.ac.in/mech/workshop/
+  - Lists the welding, fitting, foundry, carpentry, machine, CNC and turning shops.
+  - The CNC shop has a CNC lathe, CNC milling, wire-cut EDM and die-sinking EDM.
+- **ME110 Workshop-I syllabus:** https://www.iitg.ac.in/cse/ME110
+  - Gas, TIG, MAG and submerged arc welding.
+  - Shielded metal arc welding exercises.
+  - Foundry melting and pouring.
+- **Central Instruments Facility:** https://www.iitg.ac.in/cif/instruments.php and https://www.iitg.ac.in/iitg_academic?aca=central-instruments-facility
+  - 26 analytical instruments, used by 11 of the 14 departments.
+  - Includes a 400 MHz NMR and a scanning electron microscope.
+- **Note:** none of these pages give power ratings. The kW figures in `prepare_data.py` are engineering estimates (see the placeholder table below).
 
 ## Battery datasheets
 
@@ -72,13 +102,24 @@ Files marked **local** are in this folder or in `data/`. BibTeX entries for the 
 - **Implementation:** the Python package `rainflow` 3.2.0 (https://pypi.org/project/rainflow/), which implements this standard.
 - **Code:** `src/simulator.py`, `src/plot_results.py`, `src/sc_study.py`
 
-**[11] HOMER Pro** online documentation, UL Solutions / HOMER Energy (homerenergy.com). Topics: Real Discount Rate, Salvage Value, Levelized Cost of Energy, Lifetime Throughput.
+**[11] HOMER Pro** online documentation, UL Solutions / HOMER Energy. Checked 28 October 2026:
+- **Salvage value:** https://homerenergy.com/products/pro/docs/latest/salvage_value.html
+  - Linear depreciation based on replacement cost; example: 5/25 of life left gives 5/25 of the cost back.
+- **Real discount rate, CRF, NPC:**
+  - https://homerenergy.com/products/pro/docs/latest/economics.html
+  - https://homerenergy.com/products/pro/docs/latest/total_annualized_cost.html
+  - https://homerenergy.com/products/pro/docs/3.15/net_present_cost.html
+- **LCOE:** https://support.homerenergy.com/docs/results/calculations/levelized-cost-of-energy
+- **Lifetime throughput and battery life:**
+  - https://homerenergy.com/products/pro/docs/latest/battery_bank_life.html
+  - https://homerenergy.com/products/pro/docs/latest/kinetic_model.html
+  - https://homerenergy.com/docs/knowledgebase/article/storage-faqs/
+  - HOMER treats throughput as constant, independent of depth of discharge. Our rainflow model removes that limitation.
 - **Used for:**
   - Discounting at the real rate: (1.1070 / 1.0571) − 1 = 4.72%.
   - Salvage value: last unit bought × fraction of life remaining.
   - LCOE = NPC × CRF / energy served.
   - The throughput battery model, kept for comparison.
-- **Status:** look up and record the exact page URLs before citing.
 - **Code:** `src/simulator.py`
 
 ## Placeholders with no source yet
